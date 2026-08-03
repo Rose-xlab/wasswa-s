@@ -286,18 +286,56 @@ async function main() {
   }, 15_000);
 
   // ── Watchdog (#4): a silent feed is never ambiguous — warn, then self-heal. ──
+  //
+  // Liveness is judged on TWO signals, because either one alone has a blind spot:
+  //   • lastTickAt (any updateStream tick) — but Pocket Option's OWN selected-pair
+  //     chart keeps sending updateStream even when our entire rotating pool is
+  //     dead, so this can stay fresh while we are actually scanning nothing.
+  //   • pool health (__feedStatus) — conns 0 means the in-page pool was wiped
+  //     (PO reloaded its SPA and re-ran our init script); live 0 means every
+  //     socket is down. Neither shows up in lastTickAt. Watching only ticks is
+  //     what let the bot sit at "conns 0/0, alerts frozen, heartbeat = alive".
   let feedStale = false;
   let recovering = false;
   let lastRecoveryAt = 0;
   let recoveryDelayMs = 90_000;
+  let poolDownSince = 0;
   const watchdog = setInterval(async () => {
+    const st = await feedStatus();
+
+    // Fast path: the pool is EMPTY on the current page (a navigation/reload we
+    // did not initiate re-ran the init script). No reload needed — just rebuild
+    // the pool in place. The tick-based check below would never catch this,
+    // because PO's own chart keeps lastTickAt fresh.
+    if (st?.authReady && st.conns === 0 && !recovering) {
+      recovering = true;
+      try {
+        console.warn('\n  ⚠️ PocketVision: feed pool empty (page re-init?) — rebuilding pool.\n');
+        pinned.clear();
+        const reopened = await feedStart(watchlist);
+        lastTickAt = Date.now();
+        console.log(`  [watchdog] pool rebuilt for ${reopened} pairs`);
+      } finally { recovering = false; }
+      return;
+    }
+
+    // Pool exists but nothing is live, and the breaker is NOT deliberately
+    // pausing reconnects → the sockets are wedged. Track how long that lasts.
+    const poolDown = Boolean(st?.authReady) && !st?.paused && (st?.live ?? 0) === 0;
+    poolDownSince = poolDown ? (poolDownSince || Date.now()) : 0;
+    const poolDownSec = poolDownSince ? (Date.now() - poolDownSince) / 1000 : 0;
+
     const silentSec = (Date.now() - lastTickAt) / 1000;
-    if (!feedStale && silentSec > config.staleFeedSec) {
+    const stale = silentSec > config.staleFeedSec || poolDownSec > config.staleFeedSec;
+    if (!feedStale && stale) {
       feedStale = true;
-      const msg = `⚠️ PocketVision: no ticks for ${Math.round(silentSec)}s — feed looks dead, attempting recovery.`;
+      const why = silentSec > config.staleFeedSec
+        ? `no ticks for ${Math.round(silentSec)}s`
+        : `no live pool sockets for ${Math.round(poolDownSec)}s`;
+      const msg = `⚠️ PocketVision: ${why} — feed looks dead, attempting recovery.`;
       console.warn(`\n  ${msg}\n`);
       void telegram.send(msg);
-    } else if (feedStale && silentSec < config.staleFeedSec) {
+    } else if (feedStale && !stale) {
       feedStale = false;
       recoveryDelayMs = 90_000; // healthy again → next incident starts fresh
       const msg = '✅ PocketVision: feed recovered — ticks are flowing again.';
