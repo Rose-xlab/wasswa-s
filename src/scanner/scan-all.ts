@@ -21,6 +21,13 @@ import { TelegramSender, formatAlert } from '../lib/telegram.js';
 import { SupabaseSink } from '../lib/supabase.js';
 import { installFeed } from './feed-inject.js';
 import { OutcomeTracker } from './outcomes.js';
+import { FeedClock } from '../lib/clock.js';
+import { TickBuffer } from './tickbuf.js';
+import { CandleHistory } from './history.js';
+import { buildFeatures, type SetupFeatures } from './features.js';
+import { ShadowRecorder } from './shadow.js';
+import { CandleLog } from './candlelog.js';
+import { Executor } from '../exec/executor.js';
 
 /**
  * Resolves on ENTER (interactive) or SIGINT/SIGTERM (Ctrl+C, systemd stop).
@@ -51,8 +58,20 @@ async function main() {
   const labels = new Map<string, string>();
   const catalog = new Map<string, { isOpen: boolean; otc: boolean; payout: number; type: string }>();
   const tracker = new OutcomeTracker(paths.outcomesFile);
+  // Feed timestamps are broker-server time (~UTC+2), NOT epoch. Everything is
+  // normalized to true epoch at ingest; see lib/clock.ts for what this fixes.
+  const clock = new FeedClock();
+  const ticks = new TickBuffer(config.tickRetainSec);
+  const history = new CandleHistory();
+  const shadow = config.shadow.enabled
+    ? new ShadowRecorder(ticks, paths.shadowFile, config.shadow)
+    : null;
+  const candleLog = config.candleLog ? new CandleLog(paths.candlesFile) : null;
   let alertCount = 0;
   let lastTickAt = Date.now();
+  let droppedPreCalibration = 0;
+  /** Stage 2 auto-execution — created after the page exists, below. */
+  let executor: Executor | null = null;
 
   // Per-symbol tick watermark: rotation revisits re-send overlapping history,
   // so every tick at or below the watermark has already been counted.
@@ -61,10 +80,22 @@ async function main() {
   // whether a symbol's candles close on the fast grace or wait for backfill.
   const lastLiveAt = new Map<string, number>();
 
-  const ingest = (symbol: string, ts: number, price: number) => {
-    if (!Number.isFinite(ts) || !Number.isFinite(price)) return;
+  /**
+   * `feedTs` is the broker's clock. Ticks are dropped until the offset is
+   * calibrated — ingesting raw timestamps and switching later would jump every
+   * periodStart by ~2h and reset every streak. Calibration takes seconds
+   * (Pocket Option's own chart streams during the catalog wait), so nothing of
+   * value is lost.
+   */
+  const ingest = (symbol: string, feedTs: number, price: number, live: boolean) => {
+    if (!Number.isFinite(feedTs) || !Number.isFinite(price)) return;
+    if (live) clock.observeLive(feedTs); else clock.observeBackfill(feedTs);
+    if (!clock.ready) { droppedPreCalibration++; return; }
+
+    const ts = clock.toReal(feedTs);
     if (ts <= (lastTs.get(symbol) ?? 0)) return;
     lastTs.set(symbol, ts);
+    ticks.push(symbol, ts, price);
     for (const c of builder.addTick({ symbol, ts, price })) onClosedCandle(c);
   };
 
@@ -120,6 +151,20 @@ async function main() {
     }
   };
 
+  /** Most recent feature vector per symbol, handed to the executor on fire. */
+  const lastFeatures = new Map<string, SetupFeatures | undefined>();
+
+  /** Watchlist pairs currently mid-streak — the market-regime feature. */
+  const concurrentStreaks = (exclude: string) => {
+    let n = 0;
+    for (const s of watchlist) {
+      if (s === exclude) continue;
+      const st = engine.peek(s);
+      if (st?.colour && st.count >= 3) n++;
+    }
+    return n;
+  };
+
   const onClosedCandle = (candle: Candle) => {
     // Settle any pending alert outcome BEFORE the engine can register a new one.
     const outcome = tracker.onCandle(candle);
@@ -128,12 +173,42 @@ async function main() {
       supabase.outcome(outcome);
     }
 
+    // Order matters: history must include this candle before features are
+    // built from it, and shadow must score this candle as the "next" of an
+    // earlier setup BEFORE a new setup is registered against it.
+    history.push(candle);
+    shadow?.onCandle(candle);
+    candleLog?.write(candle, { payout: catalog.get(candle.symbol)?.payout, label: labels.get(candle.symbol) });
+
     // Freshness gate: candles older than one sweep (+margin) are seeded
     // history (startup backfill) — track their streak state but never alert
     // on them. A normal sweep-revisit candle is at most one sweep old.
     const closedAgoSec = Date.now() / 1000 - (candle.periodStart + candle.timeframeSec);
     const alert = engine.onCandle(candle);
     updatePin(candle.symbol);
+
+    // Shadow research log: record every streak from `collectStreak` up, well
+    // below the alert threshold. Trading narrow but logging wide is what makes
+    // "does depth actually help?" answerable instead of assumed.
+    const st = engine.peek(candle.symbol);
+    if (shadow && st?.colour && st.count >= config.shadow.collectStreak) {
+      const f = buildFeatures({
+        symbol: candle.symbol,
+        streak: st.count,
+        colour: st.colour,
+        history: history.all(candle.symbol),
+        meta: { ...catalog.get(candle.symbol), label: labels.get(candle.symbol) },
+        concurrentStreaks: concurrentStreaks(candle.symbol),
+      });
+      if (f) shadow.register(f, candle);
+      lastFeatures.set(candle.symbol, f ?? undefined);
+    }
+
+    // Stage 2: arm / fire. Deliberately fire-and-forget — the executor must
+    // never be able to stall candle processing for every other pair.
+    if (executor && st?.colour) {
+      void executor.onStreak(candle.symbol, st.count, st.colour, candle, lastFeatures.get(candle.symbol));
+    }
     if (alert && closedAgoSec <= alertFreshnessSec) {
       // Payouts drift during the session; suppress alerts for pairs that have
       // slipped below the floor since the watchlist was built.
@@ -174,7 +249,7 @@ async function main() {
       const p = frame.args?.[0] as { asset?: string; history?: [number, number][] } | undefined;
       if (p?.asset && Array.isArray(p.history)) {
         lastTickAt = Date.now(); // backfill counts as feed activity
-        for (const [ts, price] of p.history) ingest(p.asset, ts, price);
+        for (const [ts, price] of p.history) ingest(p.asset, ts, price, false);
       }
       return;
     }
@@ -184,7 +259,7 @@ async function main() {
           const tick: Tick = { symbol: t[0], ts: Number(t[1]), price: Number(t[2]) };
           lastTickAt = Date.now();
           lastLiveAt.set(tick.symbol, Date.now());
-          ingest(tick.symbol, tick.ts, tick.price);
+          ingest(tick.symbol, tick.ts, tick.price, true);
         }
       }
     }
@@ -246,6 +321,20 @@ async function main() {
   console.log(`  • Pool: ${config.feedPool} sockets | dwell ${config.dwellSec}s | full sweep ≈ ${sweepSec()}s`);
   console.log(`  • Telegram: ${telegram.isEnabled ? 'ENABLED' : 'disabled (console only)'}`);
   console.log(`  • Supabase: ${supabase.isEnabled ? 'ENABLED' : 'disabled (local log only)'}`);
+  console.log(`  • Feed clock: ${clock.describe()}`);
+  console.log(shadow
+    ? `  • Shadow log: ON — streaks ≥${config.shadow.collectStreak}, ${config.shadow.expirySec}s expiry at offsets [${config.shadow.offsets.join(', ')}]s → logs/shadow.jsonl`
+    : '  • Shadow log: disabled (SHADOW_ENABLED=false)');
+  console.log(config.exec.enabled
+    ? `  • EXECUTION: ${config.exec.dryRun ? '🧪 DRY RUN (decides + journals, clicks nothing)' : '⚠ ARMED — will place real orders on the demo account'}\n` +
+      `      ${config.exec.direction === 'ride'
+        ? 'RIDE the streak (red → SELL, green → BUY)'
+        : 'FADE the streak (red → BUY, green → SELL)'} | ` +
+      `enter at streak ${config.exec.executeStreak} (arm at ${config.exec.executeStreak - config.exec.armMargin}) | ` +
+      `stake ${config.exec.stakeFixed > 0 ? `${config.exec.stakeFixed} FIXED` : `${config.exec.stakePct}%`} (max ${config.exec.maxStake}) | payout floor ${config.exec.minPayout}%\n` +
+      `      stops: ${config.exec.maxConsecutiveLosses} losses in a row, −${config.exec.dailyLossPct}% daily, ` +
+      `${config.exec.maxTradesPerDay} trades/day | kill switch: ${paths.killSwitchFile}`
+    : '  • EXECUTION: off — places NO trades. Analysis and recording only.');
   console.log('  • Press ENTER (or send SIGTERM) to stop.');
   console.log('─────────────────────────────────────────────────────\n');
 
@@ -255,6 +344,26 @@ async function main() {
     console.warn(`  ⚠ Sweep (${sweepSec()}s) exceeds ${PIN_MARGIN} candles — raise FEED_POOL/PIN_MARGIN or lower DWELL_SEC/MAX_PAIRS to guarantee real-time alerts.`);
   }
   alertFreshnessSec = Math.max(150, sweepSec() + 60);
+
+  // ── Stage 2 executor. Refuses to arm unless the account reads as demo and
+  // the balance is legible; a failed start leaves the scanner running as a
+  // pure research tool rather than half-enabling execution. ──
+  if (config.exec.enabled) {
+    const candidate = new Executor({
+      page,
+      ticks,
+      limits: { ...config.exec, killSwitchFile: paths.killSwitchFile },
+      journalFile: paths.journalFile,
+      expirySec: config.shadow.expirySec,
+      direction: config.exec.direction,
+      payoutOf: (s) => catalog.get(s)?.payout,
+      labelOf: (s) => labels.get(s),
+    });
+    executor = (await candidate.start()) ? candidate : null;
+    if (!executor) console.log('  [exec] execution NOT enabled — scanner continues as research only.');
+  } else {
+    console.log('  [exec] disabled (EXECUTE_ENABLED=false) — analysis and shadow logging only.');
+  }
 
   const started = await feedStart(watchlist);
   console.log(`  Rotating ${started} pairs over ${config.feedPool} sockets…`);
@@ -271,6 +380,17 @@ async function main() {
   };
   const flusher = setInterval(() => {
     for (const c of builder.flush(Date.now() / 1000, graceFor)) onClosedCandle(c);
+    const note = clock.takeNote();
+    if (note) console.log(`  [clock] ${note}`);
+    void executor?.settle(Date.now() / 1000);
+    // Shadow settlement needs ticks up to entry + maxOffset + expiry, which
+    // for a rotated pair only arrive on its next visit's backfill.
+    for (const rec of shadow?.sweep(Date.now() / 1000) ?? []) {
+      const s = rec.settlements.find((x) => x.offsetSec === 0);
+      const tag = s ? `${s.result}@0s` : `no-fill(${rec.coverage})`;
+      console.log(`  [shadow] ${rec.features.symbol.replace(/_otc$/, '')} ${rec.features.streak}${rec.features.colour === 'red' ? '🔴' : '🟢'} ` +
+        `ext ${rec.features.overextension?.toFixed(2) ?? '—'} → ${rec.candle?.outcome ?? '—'} | ${tag}`);
+    }
   }, 1000);
 
   const status = setInterval(async () => {
@@ -282,7 +402,9 @@ async function main() {
       .slice(0, 6)
       .map((x) => `${x.s.replace(/_otc$/, '')} ${x.p!.count}${x.p!.colour === 'red' ? '🔴' : '🟢'}`);
     const pins = st?.pinned?.length ? ` | 📌 ${st.pinned.map((p) => p.replace(/_otc$/, '')).join(',')}` : '';
-    console.log(`  [status] conns ${st?.live ?? '?'}/${st?.conns ?? '?'} live${st?.paused ? ' | ⏸ breaker: reconnects paused' : ''}${pins} | tracking ${lastTs.size} pairs | alerts ${alertCount} | top: ${active.join('  ') || '—'}`);
+    if (executor) console.log(`  [exec] ${executor.status()}`);
+    const sh = shadow ? ` | ${shadow.summary()}` : '';
+    console.log(`  [status] conns ${st?.live ?? '?'}/${st?.conns ?? '?'} live${st?.paused ? ' | ⏸ breaker: reconnects paused' : ''}${pins} | tracking ${lastTs.size} pairs | alerts ${alertCount}${sh} | top: ${active.join('  ') || '—'}`);
   }, 15_000);
 
   // ── Watchdog (#4): a silent feed is never ambiguous — warn, then self-heal. ──
@@ -374,7 +496,7 @@ async function main() {
     ? setInterval(async () => {
         const st = await feedStatus();
         const hours = ((Date.now() - startedAt) / 3_600_000).toFixed(1);
-        telegram.enqueue(`💓 PocketVision alive ${hours}h | conns ${st?.live ?? '?'}/${st?.conns ?? '?'} | pairs ${watchlist.length} | alerts ${alertCount} | ${tracker.summary()}`);
+        telegram.enqueue(`💓 PocketVision alive ${hours}h | conns ${st?.live ?? '?'}/${st?.conns ?? '?'} | pairs ${watchlist.length} | alerts ${alertCount} | ${tracker.summary()}${shadow ? ` | ${shadow.summary()}` : ''}`);
         supabase.heartbeat({ connsLive: st?.live, connsTotal: st?.conns, pairs: watchlist.length, alerts: alertCount, summary: tracker.summary() });
       }, config.heartbeatMin * 60_000)
     : null;
@@ -389,7 +511,11 @@ async function main() {
         const toRemove = watchlist.filter((s) => !wanted.has(s));
         if (toAdd.length === 0 && toRemove.length === 0) return;
         await feedSetWatchlist(desired);
-        for (const s of toRemove) pinned.delete(s); // in-page pins already cleared
+        for (const s of toRemove) {
+          pinned.delete(s); // in-page pins already cleared
+          ticks.forget(s);  // no more data coming — don't hold its buffers
+          history.forget(s);
+        }
         watchlist = desired;
         alertFreshnessSec = Math.max(150, sweepSec() + 60);
         const fmt = (l: string[]) => l.slice(0, 6).join(', ') + (l.length > 6 ? ', …' : '');
@@ -405,6 +531,18 @@ async function main() {
   if (refresher) clearInterval(refresher);
   console.log(`\n  Session summary: ${alertCount} alerts | ${tracker.summary()}`);
   console.log(`  Outcome log: ${paths.outcomesFile}  (analyse with: npm run report)`);
+  if (shadow) {
+    console.log(`  ${shadow.summary()}`);
+    console.log(`  Shadow log:  ${paths.shadowFile}  (analyse with: npm run report:shadow)`);
+  }
+  if (droppedPreCalibration > 0) {
+    console.log(`  (${droppedPreCalibration} ticks dropped before the feed clock calibrated)`);
+  }
+  if (executor) {
+    executor.shutdown();
+    console.log(`  ${executor.tradeJournal.summary()}`);
+    console.log(`  Trade journal: ${paths.journalFile}  (analyse with: npm run report:trades)`);
+  }
   await telegram.drain();
   await context.close();
 }

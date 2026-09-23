@@ -130,8 +130,128 @@ For always-on remote operation see **[docs/VPS-WINDOWS.md](docs/VPS-WINDOWS.md)*
 get crash-restart, reboot-start, watchdog recovery, and hourly heartbeats; the
 scanner shuts down cleanly on SIGTERM (drains Telegram, closes the browser).
 
+## Phase 5 — shadow research log ⬅ *in progress*
+
+Stage 1 of the auto-trading track. **Places no trades.** It records every streak
+setup with a full feature vector and scores it against the instrument that is
+actually traded, so strategy questions stop being arguments and become columns.
+
+```bash
+npm run scan            # shadow logging runs alongside the scanner
+npm run report:shadow   # analyse logs/shadow.jsonl
+npm run report:shadow -- logs/archived.jsonl   # or an archived copy
+```
+
+**Why it exists:** `logs/outcomes.jsonl` scores `close(next) vs open(next)` — a
+candle-aligned bet. Pocket Option's Quick High/Low is a **60-second ROLLING**
+option: struck at the click, expiring exactly 60s later, straddling the candle
+boundary. The two only agree when the click lands on the candle open. Every
+setup is therefore settled at several entry offsets (`0,2,5,10,15,30s`) from
+buffered ticks, which is what makes *"how many seconds in should I click?"*
+answerable.
+
+Recorded per setup (`src/scanner/features.ts`, no lookahead — every field is
+knowable at decision time): overextension (displacement ÷ **pre-streak** ATR),
+path length and efficiency, body contraction and trend, rejection/push wicks,
+volatility percentile, position in range, concurrent streaks across the
+watchlist, tick counts, payout and its break-even, true-UTC session.
+
+Collection threshold (`SHADOW_COLLECT_STREAK=4`) is deliberately **below** the
+alert threshold — base rates at short streaks are the only way to tell whether
+depth does anything. Log wide, trade narrow.
+
+### Feed clock (fixed here)
+
+Pocket Option's tick timestamps run on broker server time, measured at a flat
+**+7200s (UTC+2)** across every capture. Candle bucketing was immune, so it went
+unnoticed — but it silently broke three things, now fixed by `src/lib/clock.ts`
+(which *measures* the offset live rather than hardcoding it, so it follows DST):
+
+- the **alert freshness gate** compared feed time to `Date.now()` and so read as
+  ~2h in the future — it never suppressed anything, and startup backfill has
+  been firing alerts for candles that closed up to 10 minutes earlier;
+- `CandleBuilder.flush()` needed two hours of wall clock to fire, so the
+  safety-net close for a dropped pair never ran;
+- every timestamp in Telegram/Supabase/reports was 2h out, which shifted the
+  by-hour analysis into the wrong session.
+
+The offset is quantized to whole minutes (real timezone offsets always are) so
+candle buckets stay aligned with Pocket Option's own, and latched so it cannot
+drift under the streak engine.
+
+## Stage 2 — auto-execution ⬅ *built, ships disabled*
+
+Places trades on the **demo** account. Both switches default off, and enabling
+the first one still leaves the second on, so the first thing you get is a full
+rehearsal that clicks nothing.
+
+```bash
+npm run probe:ui        # verify the trade-panel selectors resolve. Places nothing.
+npm run scan            # with EXECUTE_ENABLED=true (+ EXECUTE_DRY_RUN=true first)
+npm run report:trades   # fill quality, tick-vs-broker, results
+```
+
+**Entry rule:** fire when a streak reaches `EXECUTE_STREAK` (8) — the candle
+that just closed is number 8, so *now* is candle 9's open — and **fade** it:
+red streak → BUY, green streak → SELL.
+
+### The arming constraint
+
+Pocket Option's trade panel trades whatever asset the **chart** is showing, and
+switching assets takes seconds. The signal fires at a candle close and the entry
+is the next candle's open, so reacting to a signal by switching assets is
+structurally impossible. The executor therefore **pre-arms**: at
+`EXECUTE_STREAK − EXECUTE_ARM_MARGIN` it selects the hottest candidate on the
+chart, leaving only the click. One armed pair at a time — which enforces the
+concurrency limit for free. A second pair completing while another is armed is
+journaled as `missed`, never silently dropped.
+
+### Guardrails (`src/exec/guards.ts`)
+
+A pure function over explicit state, so every rule is proved in `npm run test:core`.
+Evaluated in order, cheapest and most absolute first:
+
+| Gate | Behaviour |
+|---|---|
+| `EXECUTE_ENABLED=false` | never clicks |
+| `logs/HALT` exists | stops immediately — checked before every click |
+| already halted | blocked until the UTC day rolls |
+| **not a demo account** | refuses **and halts**; needs `PV_ALLOW_LIVE=I_UNDERSTAND_REAL_MONEY` |
+| daily drawdown ≥ 5% | halts the day |
+| 3 consecutive losses | halts the day |
+| trades/day, concurrency, cooldown, payout floor | blocks this trade |
+| sizing (last) | flat % of *current* balance, hard cap |
+
+The demo check is a **fact read from the live page** (URL *and* balance label,
+both required, unreadable → not demo), re-verified on every fire — never a
+config flag, because a config flag is what gets flipped at 2am. There is **no
+martingale path in the code**: stake is always a flat percentage of the current
+balance, so it shrinks in drawdown. At a 55% win rate a six-loss run arrives
+every 60–100 trades, and recovering one unit after six martingale steps costs 63.
+
+### Trade journal (`logs/trades.jsonl`)
+
+Records `placed` / `dry-run` / `refused` / `missed` — a journal of only the
+trades you took is a survivorship-biased record of your own reflexes. Every
+settled trade is scored **twice**: from the tick feed (strike vs expiry price)
+and from the observed **balance delta** (the broker's verdict). Disagreement is
+the most valuable column in the file — it is slippage, a rejected click, or a
+strike that did not land where the feed said. Believe the balance.
+
+> ⚠ The trade-panel selectors in `src/exec/terminal.ts` are best-effort against a
+> hashed-class React SPA. **Run `npm run probe:ui` before enabling execution**
+> and after any Pocket Option redesign. Every selector is overridable via
+> `PO_SEL_*` env vars, and every method reports failure rather than clicking
+> blind — a mis-resolved `setAmount` would otherwise trade whatever stake
+> happened to be in the box.
+
 ## Roadmap
-- **Phase 5** — access: login-protected realtime dashboard (anon key + read policies), CSV export.
+- **Stage 3** — adaptive allocation: Thompson sampling over setup buckets
+  (asset class × depth × overextension × session) rather than price prediction.
+  Beta posteriors stay honest about small samples and decay gracefully when the
+  broker changes their generator.
+- **Phase 6** — access: login-protected realtime dashboard (anon key + read
+  policies), CSV export.
 
 ## Security notes (from the brief, section 10)
 - Pocket Option password is **never** stored — you log in by hand; only cookies/localStorage are saved locally.

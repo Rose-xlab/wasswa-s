@@ -17,6 +17,15 @@ export const paths = {
   diagnosticsDir: path.join(ROOT, 'diagnostics'),
   /** Alert outcome log (JSONL, one record per resolved alert). */
   outcomesFile: path.join(ROOT, 'logs', 'outcomes.jsonl'),
+  /** Shadow research log (JSONL: features + rolling-expiry settlements). */
+  shadowFile: path.join(ROOT, 'logs', 'shadow.jsonl'),
+  /** Raw candle log (JSONL: every closed candle) — the primitive every
+   *  candle-based hypothesis is replayed from, including multi-leg waves. */
+  candlesFile: path.join(ROOT, 'logs', 'candles.jsonl'),
+  /** Trade journal (JSONL: every placed / dry-run / refused / missed trade). */
+  journalFile: path.join(ROOT, 'logs', 'trades.jsonl'),
+  /** Create this file to stop execution immediately. */
+  killSwitchFile: path.join(ROOT, 'logs', 'HALT'),
 };
 
 export const config = {
@@ -67,4 +76,55 @@ export const config = {
   heartbeatMin: Number(process.env.HEARTBEAT_MIN ?? 60),
   /** Rebuild the auto-watchlist this often, minutes (0 = off). */
   watchlistRefreshMin: Number(process.env.WATCHLIST_REFRESH_MIN ?? 10),
+
+  // ── Shadow research log (Stage 1 of auto-trading: record, never trade) ──
+  shadow: {
+    enabled: (process.env.SHADOW_ENABLED ?? 'true').toLowerCase() === 'true',
+    /** Log every streak this long or longer — deliberately below the alert
+     *  threshold, so the base rates at short streaks are captured too. */
+    collectStreak: Number(process.env.SHADOW_COLLECT_STREAK ?? 4),
+    /** Click offsets (sec after the entry candle's open) to score. */
+    offsets: (process.env.SHADOW_ENTRY_OFFSETS ?? '0,2,5,10,15,30')
+      .split(',').map((s) => Number(s.trim())).filter((n) => Number.isFinite(n) && n >= 0),
+    /** Option life — the terminal's "Time" field (Quick High/Low default 60s). */
+    expirySec: Number(process.env.SHADOW_EXPIRY_SEC ?? 60),
+    /** Stop waiting for settlement ticks after this long. */
+    resolveTimeoutSec: Number(process.env.SHADOW_RESOLVE_TIMEOUT_SEC ?? 600),
+  },
+  /** Per-symbol tick retention, seconds — must exceed a full sweep + expiry. */
+  tickRetainSec: Number(process.env.TICK_RETAIN_SEC ?? 1200),
+  /** Log every closed candle to logs/candles.jsonl (~6 MB/day). Lets any new
+   *  candle hypothesis be replayed offline instead of collected overnight. */
+  candleLog: (process.env.CANDLE_LOG ?? 'true').toLowerCase() === 'true',
+
+  // ── Stage 2: auto-execution (DEMO ONLY unless PV_ALLOW_LIVE is set) ──
+  // Both switches default OFF. Turning EXECUTE_ENABLED on still leaves DRY_RUN
+  // on, so the first thing you get is a full rehearsal that clicks nothing.
+  exec: {
+    enabled: (process.env.EXECUTE_ENABLED ?? 'false').toLowerCase() === 'true',
+    dryRun: (process.env.EXECUTE_DRY_RUN ?? 'true').toLowerCase() === 'true',
+    /**
+     * Which side to take.
+     *   'fade' — bet the streak breaks (red → BUY, green → SELL). The original
+     *            strategy; measured at 33% reversal on 33 live alerts.
+     *   'ride' — bet the streak continues (red → SELL, green → BUY).
+     * Recorded on every journal row, so mixed-mode data stays readable.
+     */
+    direction: (process.env.EXECUTE_DIRECTION ?? 'fade').toLowerCase() === 'ride' ? 'ride' as const : 'fade' as const,
+    /** Streak length that triggers entry — 8 means "enter on candle 9". */
+    executeStreak: Number(process.env.EXECUTE_STREAK ?? 8),
+    /** Pre-select the chart this many candles before the trigger. */
+    armMargin: Number(process.env.EXECUTE_ARM_MARGIN ?? 2),
+    /** Flat cash stake; when > 0 it overrides the percentage. */
+    stakeFixed: Number(process.env.EXECUTE_STAKE_FIXED ?? 0),
+    stakePct: Number(process.env.EXECUTE_STAKE_PCT ?? 1),
+    maxStake: Number(process.env.EXECUTE_MAX_STAKE ?? 1000),
+    minStake: Number(process.env.EXECUTE_MIN_STAKE ?? 1),
+    minPayout: Number(process.env.EXECUTE_MIN_PAYOUT ?? 90),
+    maxConcurrent: Number(process.env.EXECUTE_MAX_CONCURRENT ?? 1),
+    maxTradesPerDay: Number(process.env.EXECUTE_MAX_TRADES_PER_DAY ?? 30),
+    maxConsecutiveLosses: Number(process.env.EXECUTE_MAX_CONSEC_LOSSES ?? 3),
+    dailyLossPct: Number(process.env.EXECUTE_DAILY_LOSS_PCT ?? 5),
+    cooldownSec: Number(process.env.EXECUTE_COOLDOWN_SEC ?? 30),
+  },
 };

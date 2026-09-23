@@ -24,6 +24,26 @@ export async function openPersistentContext(opts: { headless: boolean }): Promis
   });
 }
 
+/**
+ * Shim for tsx/esbuild's `keepNames` helper.
+ *
+ * esbuild rewrites `const f = () => {}` into `const f = __name(() => {}, "f")`,
+ * and `__name` is defined at MODULE scope — it is not carried along when
+ * Playwright serializes a callback into the page. Any page.evaluate containing
+ * a named inner function therefore dies with `__name is not defined`.
+ *
+ * The scanner never hit this because installFeed shims `__name` as its first
+ * act, so every evaluate on that page works. Tools that do not install the feed
+ * must install this, or they fail where the scanner succeeds — which is exactly
+ * how a diagnostic ends up less capable than the thing it is diagnosing.
+ *
+ * Must be passed to `context.addInitScript` BEFORE navigating.
+ */
+export function installNameShim(): void {
+  const g = globalThis as unknown as Record<string, unknown>;
+  if (typeof g.__name !== 'function') g.__name = (fn: unknown) => fn;
+}
+
 /** The first page of a persistent context, creating one if none exists. */
 export async function firstPage(context: BrowserContext): Promise<Page> {
   return context.pages()[0] ?? (await context.newPage());

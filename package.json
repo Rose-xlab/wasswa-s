@@ -17,6 +17,11 @@
     "scan": "tsx src/scanner/scan-all.ts",
     "test:telegram": "tsx src/tools/telegram-test.ts",
     "report": "tsx src/tools/report.ts",
+    "report:shadow": "tsx src/tools/shadow-report.ts",
+    "report:sequence": "tsx src/tools/sequence-report.ts",
+    "report:trades": "tsx src/tools/trades-report.ts",
+    "probe:ui": "tsx src/tools/probe-ui.ts",
+    "probe:asset": "tsx src/tools/probe-asset.ts",
     "test:core": "tsx src/scanner/selftest.ts",
     "typecheck": "tsc --noEmit"
   },
