@@ -259,3 +259,5 @@ strike that did not land where the feed said. Believe the balance.
 - Credentials (Telegram/Supabase) will live in env vars, never hardcoded.
 - Supabase **service role key** will live only on the VPS scanner — never shipped to the browser.
 - `.auth/`, `logs/`, `diagnostics/`, and `.env` are all gitignored.
+#   w a s s w a - s  
+ 
